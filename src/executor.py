@@ -3,22 +3,13 @@ executor.py
 -----------
 Executes validated TestStep objects against a real browser using
 Playwright's synchronous API.
-
-This module is the "hands" of the agentic test framework: parser.py turns
-plain-English into validated TestStep objects, and executor.py performs
-those steps in a live browser and reports the outcome of each one.
-
-Design goals (see module docstring notes and inline comments):
-  * Never crash the whole run because of one bad step.
-  * Locate elements robustly using several fallback strategies.
-  * Fail fast (explicit timeouts) instead of hanging on defaults.
-  * Report the outcome of every step, even after a failure.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Callable, List, Literal, Optional
 
 from playwright.sync_api import Error as PlaywrightError
@@ -26,34 +17,14 @@ from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
 
-# Import your existing schema. Adjust the module path if parser.py lives
-# somewhere else in your package.
 from parser import TestStep
 
 
-# --------------------------------------------------------------------------- #
-# Logging
-# --------------------------------------------------------------------------- #
-# We configure a module-level logger rather than using print(). Logging gives
-# us levels (INFO/WARNING/ERROR), timestamps, and the ability to redirect
-# output to a file or a UI later without touching call sites. print() would
-# force us to rip out statements everywhere when we productionise this.
 logger = logging.getLogger(__name__)
 
-
-# A single explicit timeout used for every locator/action. Playwright's default
-# is 30s, which means a broken selector search can hang the run for half a
-# minute per step. 5s is long enough for a normally-loading element but short
-# enough to fail fast on a genuinely missing one.
 DEFAULT_TIMEOUT_MS: float = 5000
 
 
-# --------------------------------------------------------------------------- #
-# Custom exception hierarchy
-# --------------------------------------------------------------------------- #
-# Mirrors the parser's ParserError/LLMParseError/RuleParseError pattern.
-# Custom exceptions let calling code distinguish *our* well-understood failure
-# modes from unexpected bugs, and let us attach clear, domain-specific messages.
 class ExecutorError(Exception):
     """Base class for all errors raised by the executor module."""
 
@@ -66,18 +37,7 @@ class NavigationError(ExecutorError):
     """Raised when navigating to a URL fails."""
 
 
-# --------------------------------------------------------------------------- #
-# Result model
-# --------------------------------------------------------------------------- #
 class StepResult(BaseModel):
-    """
-    Structured outcome of executing a single TestStep.
-
-    Using a Pydantic model (rather than a dict) keeps the result schema
-    validated and self-documenting, and makes it trivial to serialise the
-    final report to JSON for a UI or CI pipeline.
-    """
-
     step_number: int
     action: str
     description: str
@@ -86,24 +46,15 @@ class StepResult(BaseModel):
     duration_ms: float
 
 
-# --------------------------------------------------------------------------- #
-# Smart element locating
-# --------------------------------------------------------------------------- #
 import re
 
 _FILLER_WORDS = re.compile(r"\b(field|button|box|link|the)\b", re.IGNORECASE)
 
 
 def find_element(page, description: str):
-    """
-    Try several strategies to locate an element matching a human description.
-    Strips filler words (e.g. "field", "button") since real HTML rarely
-    contains them literally — searching for "username field" verbatim will
-    almost never match anything, even though "username" alone will.
-    """
     keyword = _FILLER_WORDS.sub("", description).strip()
     if not keyword:
-        keyword = description  # fallback if stripping left nothing useful
+        keyword = description
 
     pattern = re.compile(re.escape(keyword), re.IGNORECASE)
 
@@ -131,49 +82,17 @@ def find_element(page, description: str):
     raise ElementNotFoundError(f"No locator strategy could find an element for: '{description}'")
 
 
-# --------------------------------------------------------------------------- #
-# Per-action helpers
-# --------------------------------------------------------------------------- #
 def _do_goto(page: Page, step: TestStep) -> str:
-    """
-    Navigate the page to step.url.
-
-    Args:
-        page: The active Playwright Page object.
-        step: The TestStep whose action is "goto".
-
-    Returns:
-        A success message describing the navigation.
-
-    Raises:
-        NavigationError: If step.url is missing or navigation fails.
-    """
     if not step.url:
         raise NavigationError("goto step is missing a 'url' value")
     try:
         page.goto(step.url, timeout=DEFAULT_TIMEOUT_MS)
-    except Exception as exc:  # noqa: BLE001
-        # Wrap ANY navigation failure (timeout, DNS, connection refused, etc.)
-        # in our own exception with context, rather than leaking Playwright's.
+    except Exception as exc:
         raise NavigationError(f"Failed to navigate to '{step.url}': {exc}") from exc
     return f"Navigated to {step.url}"
 
 
 def _do_type(page: Page, step: TestStep) -> str:
-    """
-    Fill the target element with step.value.
-
-    Args:
-        page: The active Playwright Page object.
-        step: The TestStep whose action is "type".
-
-    Returns:
-        A success message describing what was typed.
-
-    Raises:
-        ExecutorError: If target or value is missing.
-        ElementNotFoundError: If the target element cannot be located.
-    """
     if not step.target:
         raise ExecutorError("type step is missing a 'target'")
     if step.value is None:
@@ -184,20 +103,6 @@ def _do_type(page: Page, step: TestStep) -> str:
 
 
 def _do_click(page: Page, step: TestStep) -> str:
-    """
-    Click the target element.
-
-    Args:
-        page: The active Playwright Page object.
-        step: The TestStep whose action is "click".
-
-    Returns:
-        A success message describing the click.
-
-    Raises:
-        ExecutorError: If target is missing.
-        ElementNotFoundError: If the target element cannot be located.
-    """
     if not step.target:
         raise ExecutorError("click step is missing a 'target'")
     locator = find_element(page, step.target)
@@ -206,23 +111,6 @@ def _do_click(page: Page, step: TestStep) -> str:
 
 
 def _do_verify(page: Page, step: TestStep) -> str:
-    """
-    Verify that step.value text is present on the page.
-
-    We check the rendered page content for the expected text. Using
-    page.content() (the current DOM HTML) keeps the check simple and robust;
-    for stricter assertions you could swap in expect(locator).to_be_visible().
-
-    Args:
-        page: The active Playwright Page object.
-        step: The TestStep whose action is "verify".
-
-    Returns:
-        A success message confirming the text was found.
-
-    Raises:
-        ExecutorError: If value is missing or the text is not present.
-    """
     if step.value is None:
         raise ExecutorError("verify step is missing a 'value' to check for")
     content = page.content()
@@ -231,8 +119,6 @@ def _do_verify(page: Page, step: TestStep) -> str:
     return f"Verified text '{step.value}' is present"
 
 
-# Dispatch table maps each action to its handler. Cleaner than a long if/elif
-# chain and, like the strategy list, makes adding a new action a one-line edit.
 _ACTION_HANDLERS: dict[str, Callable[[Page, TestStep], str]] = {
     "goto": _do_goto,
     "type": _do_type,
@@ -242,21 +128,54 @@ _ACTION_HANDLERS: dict[str, Callable[[Page, TestStep], str]] = {
 
 
 # --------------------------------------------------------------------------- #
-# Single-step execution
+# NEW: failure screenshot capture
 # --------------------------------------------------------------------------- #
-def run_step(page: Page, step: TestStep, step_number: int = 1) -> StepResult:
+def _capture_failure_screenshot(page: Page, screenshot_dir: str, step_number: int) -> None:
+    """
+    Best-effort screenshot capture for a failed step.
+
+    This is intentionally a "never raises" helper, mirroring the same
+    defensive philosophy used everywhere else in this project (parser.py's
+    broad exception handling, executor.py's run_step safety net): a
+    screenshot is a nice-to-have for the report, and a failure to capture
+    one (page already closed, disk full, permissions issue) must never mask
+    the *original* step failure or crash the run.
+
+    Args:
+        page: The active Playwright Page object at the moment of failure.
+        screenshot_dir: Directory to save the screenshot into (created if
+            it doesn't exist).
+        step_number: 1-based step number, used to build the filename so the
+            reporter's naming convention (`step_{n}.png`) can find it.
+    """
+    try:
+        directory = Path(screenshot_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"step_{step_number}.png"
+        page.screenshot(path=str(path))
+        logger.info("Saved failure screenshot for step %d to %s", step_number, path)
+    except Exception as exc:  # noqa: BLE001
+        # Broad catch-all is deliberate: ANY screenshot failure (Playwright
+        # error, OSError, permission error, closed page, etc.) must degrade
+        # silently rather than propagate and hide the real step failure.
+        logger.warning("Could not capture screenshot for step %d: %s", step_number, exc)
+
+
+def run_step(
+    page: Page,
+    step: TestStep,
+    step_number: int = 1,
+    screenshot_dir: Optional[str] = None,
+) -> StepResult:
     """
     Execute exactly one TestStep and return a structured StepResult.
-
-    This function is the safety boundary of the executor. EVERY possible
-    failure -- expected or not -- is caught here and converted into a
-    status="fail" StepResult. Nothing is allowed to propagate out and crash
-    the run. That guarantee is what lets run_plan continue past failures.
 
     Args:
         page: The active Playwright Page object.
         step: A validated TestStep to execute.
         step_number: 1-based index of this step, used in the report.
+        screenshot_dir: Optional directory to save a screenshot into when
+            this step fails. If omitted, no screenshot is captured.
 
     Returns:
         A StepResult describing the outcome (pass or fail), with timing.
@@ -267,8 +186,6 @@ def run_step(page: Page, step: TestStep, step_number: int = 1) -> StepResult:
     try:
         handler = _ACTION_HANDLERS.get(step.action)
         if handler is None:
-            # Should be impossible given the Pydantic Literal, but we defend
-            # against it anyway rather than assume upstream validation held.
             raise ExecutorError(f"Unsupported action: '{step.action}'")
 
         message = handler(page, step)
@@ -283,25 +200,24 @@ def run_step(page: Page, step: TestStep, step_number: int = 1) -> StepResult:
             duration_ms=duration_ms,
         )
 
-    # --- Specific handling first, for clearer messages / logging ---------- #
     except PlaywrightTimeoutError as exc:
         message = f"Timed out ({DEFAULT_TIMEOUT_MS} ms): {exc}"
     except (ElementNotFoundError, NavigationError, ExecutorError) as exc:
-        # Our own well-understood domain errors.
         message = str(exc)
     except PlaywrightError as exc:
-        # Any other Playwright-level error (detached element, bad selector...).
         message = f"Playwright error: {exc}"
-    # --- Broad catch-all LAST: this is the critical safety net ------------ #
     except Exception as exc:  # noqa: BLE001
-        # This mirrors the exact bug you hit in parser.py: an *unanticipated*
-        # exception type (there, a Gemini ServerError) had no handler and
-        # crashed everything. Here, anything we didn't foresee still becomes a
-        # clean failed result instead of taking down the whole test run.
         message = f"Unexpected error: {type(exc).__name__}: {exc}"
 
     duration_ms = (time.perf_counter() - start) * 1000
     logger.error("Step %d FAIL (%s): %s", step_number, step.action, message)
+
+    # NEW: capture a screenshot for this failure, best-effort. Placed after
+    # the duration/logging so a screenshot failure never affects the
+    # measured step timing or masks the original error log line above.
+    if screenshot_dir:
+        _capture_failure_screenshot(page, screenshot_dir, step_number)
+
     return StepResult(
         step_number=step_number,
         action=step.action,
@@ -312,21 +228,19 @@ def run_step(page: Page, step: TestStep, step_number: int = 1) -> StepResult:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Full-plan execution
-# --------------------------------------------------------------------------- #
-def run_plan(page: Page, steps: List[TestStep]) -> List[StepResult]:
+def run_plan(
+    page: Page,
+    steps: List[TestStep],
+    screenshot_dir: Optional[str] = None,
+) -> List[StepResult]:
     """
     Execute a list of TestSteps in order, without stopping on failure.
-
-    Unlike a typical short-circuiting script, we run EVERY step so the final
-    report shows the outcome of each one. This is far more useful for
-    debugging: you see not just where it first broke, but everything that
-    happened after, which often reveals cascading or unrelated issues.
 
     Args:
         page: The active Playwright Page object.
         steps: The ordered list of validated TestSteps to execute.
+        screenshot_dir: Optional directory to save failure screenshots into.
+            Passed straight through to run_step for each failed step.
 
     Returns:
         A list of StepResult objects, one per input step, in order.
@@ -335,8 +249,7 @@ def run_plan(page: Page, steps: List[TestStep]) -> List[StepResult]:
     logger.info("Starting run_plan with %d step(s)", len(steps))
 
     for index, step in enumerate(steps, start=1):
-        # run_step never raises, so a single bad step can't abort the loop.
-        result = run_step(page, step, step_number=index)
+        result = run_step(page, step, step_number=index, screenshot_dir=screenshot_dir)
         results.append(result)
 
     passed = sum(1 for r in results if r.status == "pass")
@@ -344,19 +257,7 @@ def run_plan(page: Page, steps: List[TestStep]) -> List[StepResult]:
     return results
 
 
-# --------------------------------------------------------------------------- #
-# Small utility
-# --------------------------------------------------------------------------- #
 def _describe(step: TestStep) -> str:
-    """
-    Build a short human-readable description of a step for the report.
-
-    Args:
-        step: The TestStep to describe.
-
-    Returns:
-        A concise one-line description, e.g. "click 'Sign in'".
-    """
     parts = [step.action]
     if step.url:
         parts.append(step.url)
