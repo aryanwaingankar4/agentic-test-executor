@@ -132,7 +132,6 @@ def _parse_json_to_steps(cleaned_json: str) -> list[TestStep]:
     if not isinstance(data, list):
         raise LLMParseError("Expected a JSON array of steps at the top level")
 
-    # ValidationError propagates on purpose — used for self-correction upstream.
     return [TestStep(**item) for item in data]
 
 
@@ -154,16 +153,6 @@ def _is_transient(exc: BaseException) -> bool:
 def _call_gemini(contents: str) -> str:
     """
     Make a single Gemini call and return the raw text response.
-
-    tenacity retries transient failures (network hiccups, 5xx, rate limits)
-    up to 3 times with exponential backoff. If ALL retries are exhausted —
-    e.g. Gemini's servers are genuinely down (a 503 UNAVAILABLE, which is
-    Google's servers being overloaded, not a bug on our end) — `reraise=True`
-    re-raises the ORIGINAL exception (a google.genai.errors.ServerError, not
-    one of our own types). That's exactly why parse_with_llm below now wraps
-    its calls in a broad except Exception: something has to catch that raw
-    SDK error and convert it into our own LLMParseError, or it crashes the
-    whole program instead of triggering our rule-based fallback.
     """
     from google import genai
     from google.genai import types
@@ -181,6 +170,7 @@ def _call_gemini(contents: str) -> str:
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0,
+            http_options=types.HttpOptions(timeout=15000),
         ),
     )
 
@@ -193,16 +183,14 @@ def _call_gemini(contents: str) -> str:
 def parse_with_llm(raw_text: str) -> list[TestStep]:
     """
     Parse via Gemini. On a *validation* failure, retry ONCE with the error
-    appended so the model can fix its own mistake. On ANY OTHER failure
-    (API down, network error, malformed JSON, etc.), convert it to
-    LLMParseError immediately so parse_steps() can fall back to rules.
+    appended so the model can fix its own mistake. On ANY OTHER failure,
+    convert it to LLMParseError immediately so parse_steps() can fall back.
     """
     if not raw_text or not raw_text.strip():
         raise LLMParseError("Cannot parse empty input")
 
     prompt = f"Parse these test steps:\n{raw_text}"
 
-    # ---- Attempt 1 ----
     try:
         raw_output = _call_gemini(prompt)
         cleaned = _extract_json_array(raw_output)
@@ -215,18 +203,11 @@ def parse_with_llm(raw_text: str) -> list[TestStep]:
             first_error,
         )
     except LLMParseError:
-        # Already our own type (e.g. missing key, empty response) — let it
-        # propagate straight up to parse_steps(), no need to retry here.
         raise
     except Exception as exc:
-        # THE FIX: anything else — a raw SDK error like ServerError (503),
-        # a connection failure, etc. — gets converted here instead of
-        # crashing the program. This is what "graceful fallback" actually
-        # requires: catching failure modes you didn't originally anticipate.
         logger.warning("Gemini call failed with an unexpected error: %s", exc)
         raise LLMParseError(f"Gemini call failed: {exc}") from exc
 
-    # ---- Attempt 2: self-correction (only reached after a ValidationError) ----
     correction_prompt = (
         f"{prompt}\n\n"
         f"Your previous answer failed validation with this error:\n"
@@ -248,6 +229,27 @@ def parse_with_llm(raw_text: str) -> list[TestStep]:
     except Exception as exc:
         logger.warning("Gemini self-correction call failed: %s", exc)
         raise LLMParseError(f"Gemini self-correction call failed: {exc}") from exc
+
+
+# --------------------------------------------------------------------------- #
+# NEW: quote-stripping helper for the rule-based fallback parser
+# --------------------------------------------------------------------------- #
+_QUOTED_TEXT_RE = re.compile(r'["\']([^"\']+)["\']')
+
+
+def _strip_quotes(text: Optional[str]) -> Optional[str]:
+    """
+    Extract the quoted portion of a string if present, otherwise return it
+    trimmed as-is. Handles two real issues seen with raw regex captures:
+      1. `type "tomsmith" into...` capturing the value WITH its quote marks.
+      2. `verify the page shows the text "X"` capturing the whole trailing
+         phrase instead of just the quoted part — searching for a quoted
+         substring anywhere in the captured text fixes both at once.
+    """
+    if not text:
+        return text
+    match = _QUOTED_TEXT_RE.search(text)
+    return match.group(1) if match else text.strip()
 
 
 _RULE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -298,8 +300,16 @@ def parse_with_rules(raw_text: str) -> list[TestStep]:
                 continue
 
             fields = match.groupdict()
+            # CHANGED: the "value" field now goes through _strip_quotes so
+            # captured text like '"tomsmith"' becomes 'tomsmith', and a
+            # captured phrase like 'the page shows the text "X"' becomes
+            # just 'X'. target/url are cleaned as before.
             cleaned_fields = {
-                key: value.strip().rstrip(".") if value else None
+                key: (
+                    _strip_quotes(value.rstrip("."))
+                    if key == "value"
+                    else value.strip().rstrip(".") if value else None
+                )
                 for key, value in fields.items()
             }
 
