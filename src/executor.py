@@ -48,7 +48,32 @@ class StepResult(BaseModel):
 
 import re
 
-_FILLER_WORDS = re.compile(r"\b(field|button|box|link|the)\b", re.IGNORECASE)
+_FILLER_WORDS = re.compile(
+    r"\b(field|button|box|link|the|input|dropdown|menu|icon)\b", re.IGNORECASE
+)
+
+
+def _prefer_actionable(locator):
+    """
+    Given a locator that may resolve to multiple elements, prefer the first
+    element that is both visible and enabled. Falls back to ``.first`` when
+    no such element exists (or when introspection fails), mirroring the
+    module's defensive, never-crash philosophy.
+    """
+    try:
+        count = locator.count()
+    except Exception:
+        return locator.first
+
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if candidate.is_visible() and candidate.is_enabled():
+                return candidate
+        except Exception:
+            continue
+
+    return locator.first
 
 
 def find_element(page, description: str):
@@ -58,24 +83,32 @@ def find_element(page, description: str):
 
     pattern = re.compile(re.escape(keyword), re.IGNORECASE)
 
+    # NEW: data-testid / data-test placed early — the standard hook for
+    # testable web apps — ahead of generic id/name matching.
     strategies = [
-        lambda: page.get_by_placeholder(pattern),
-        lambda: page.get_by_label(pattern),
-        lambda: page.get_by_role("button", name=pattern),
-        lambda: page.get_by_role("link", name=pattern),
-        lambda: page.get_by_text(pattern),
-        lambda: page.locator(f"#{keyword}"),
-        lambda: page.locator(f"[name*='{keyword}' i]"),
-        lambda: page.locator(f"[id*='{keyword}' i]"),
-        lambda: page.locator(f"[aria-label*='{keyword}' i]"),
-        lambda: page.locator("button[type=submit], input[type=submit]"),
+        ("data-testid", lambda: page.locator(f"[data-testid*='{keyword}' i]")),
+        ("data-test", lambda: page.locator(f"[data-test*='{keyword}' i]")),
+        ("placeholder", lambda: page.get_by_placeholder(pattern)),
+        ("label", lambda: page.get_by_label(pattern)),
+        ("role=button", lambda: page.get_by_role("button", name=pattern)),
+        ("role=link", lambda: page.get_by_role("link", name=pattern)),
+        ("text", lambda: page.get_by_text(pattern)),
+        ("id-exact", lambda: page.locator(f"#{keyword}")),
+        ("name-contains", lambda: page.locator(f"[name*='{keyword}' i]")),
+        ("id-contains", lambda: page.locator(f"[id*='{keyword}' i]")),
+        ("aria-label-contains", lambda: page.locator(f"[aria-label*='{keyword}' i]")),
+        ("submit-fallback", lambda: page.locator("button[type=submit], input[type=submit]")),
     ]
 
-    for strategy in strategies:
+    for name, strategy in strategies:
         try:
             locator = strategy()
             if locator.count() > 0:
-                return locator.first
+                logger.debug(
+                    "find_element matched via strategy '%s' for description %r (keyword %r)",
+                    name, description, keyword,
+                )
+                return _prefer_actionable(locator)
         except Exception:
             continue
 
@@ -119,11 +152,91 @@ def _do_verify(page: Page, step: TestStep) -> str:
     return f"Verified text '{step.value}' is present"
 
 
-_ACTION_HANDLERS: dict[str, Callable[[Page, TestStep], str]] = {
+def _do_select(page: Page, step: TestStep) -> str:
+    if not step.target:
+        raise ExecutorError("select step is missing a 'target'")
+    if step.value is None:
+        raise ExecutorError("select step is missing a 'value'")
+    locator = find_element(page, step.target)
+    locator.select_option(label=step.value, timeout=DEFAULT_TIMEOUT_MS)
+    return f"Selected '{step.value}' in '{step.target}'"
+
+
+def _do_hover(page: Page, step: TestStep) -> str:
+    if not step.target:
+        raise ExecutorError("hover step is missing a 'target'")
+    locator = find_element(page, step.target)
+    locator.hover(timeout=DEFAULT_TIMEOUT_MS)
+    return f"Hovered over '{step.target}'"
+
+
+def _do_press(page: Page, step: TestStep) -> str:
+    if step.value is None:
+        raise ExecutorError("press step is missing a 'value' (the key to press)")
+    if step.target:
+        locator = find_element(page, step.target)
+        locator.press(step.value, timeout=DEFAULT_TIMEOUT_MS)
+        return f"Pressed '{step.value}' on '{step.target}'"
+    page.keyboard.press(step.value)
+    return f"Pressed '{step.value}' on the current focus"
+
+
+def _do_wait(page: Page, step: TestStep) -> str:
+    if step.value is None:
+        raise ExecutorError("wait step is missing a 'value' (ms or a selector/description)")
+
+    # Numeric value -> fixed wait in milliseconds.
+    stripped = step.value.strip()
+    try:
+        milliseconds = float(stripped)
+    except ValueError:
+        milliseconds = None
+
+    if milliseconds is not None:
+        page.wait_for_timeout(milliseconds)
+        return f"Waited {stripped} ms"
+
+    # Otherwise treat the value as a selector/description to wait for.
+    locator = find_element(page, stripped)
+    locator.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    return f"Waited for '{stripped}' to appear"
+
+
+def _do_screenshot(
+    page: Page,
+    step: TestStep,
+    step_number: int = 1,
+    screenshot_dir: Optional[str] = None,
+) -> str:
+    """
+    Manually capture a screenshot regardless of pass/fail state.
+
+    Reuses the reporter's ``step_{n}.png`` naming convention so the report
+    can embed it. When no ``screenshot_dir`` is configured this degrades to
+    a no-op success rather than failing the step, consistent with the
+    project's defensive philosophy.
+    """
+    if not screenshot_dir:
+        logger.info("screenshot step %d requested but no screenshot_dir configured", step_number)
+        return "Screenshot skipped (no screenshot_dir configured)"
+
+    directory = Path(screenshot_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"step_{step_number}.png"
+    page.screenshot(path=str(path))
+    return f"Captured screenshot to {path}"
+
+
+_ACTION_HANDLERS: dict[str, Callable[..., str]] = {
     "goto": _do_goto,
     "type": _do_type,
     "click": _do_click,
     "verify": _do_verify,
+    "select": _do_select,
+    "hover": _do_hover,
+    "press": _do_press,
+    "wait": _do_wait,
+    "screenshot": _do_screenshot,
 }
 
 
@@ -175,7 +288,9 @@ def run_step(
         step: A validated TestStep to execute.
         step_number: 1-based index of this step, used in the report.
         screenshot_dir: Optional directory to save a screenshot into when
-            this step fails. If omitted, no screenshot is captured.
+            this step fails. If omitted, no screenshot is captured. It is
+            also passed through to the manual ``screenshot`` action so it
+            can save ``step_{n}.png`` even on a passing step.
 
     Returns:
         A StepResult describing the outcome (pass or fail), with timing.
@@ -188,7 +303,12 @@ def run_step(
         if handler is None:
             raise ExecutorError(f"Unsupported action: '{step.action}'")
 
-        message = handler(page, step)
+        # The manual screenshot action needs the step number and directory to
+        # build its filename; all other handlers take (page, step) only.
+        if step.action == "screenshot":
+            message = handler(page, step, step_number=step_number, screenshot_dir=screenshot_dir)
+        else:
+            message = handler(page, step)
         duration_ms = (time.perf_counter() - start) * 1000
         logger.info("Step %d PASS (%s): %s", step_number, step.action, message)
         return StepResult(

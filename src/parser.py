@@ -45,7 +45,17 @@ class RuleParseError(ParserError):
 class TestStep(BaseModel):
     """One executable test instruction, validated on creation."""
 
-    action: Literal["goto", "type", "click", "verify"]
+    action: Literal[
+        "goto",
+        "type",
+        "click",
+        "verify",
+        "select",
+        "hover",
+        "press",
+        "wait",
+        "screenshot",
+    ]
     target: Optional[str] = None
     value: Optional[str] = None
     url: Optional[str] = None
@@ -64,6 +74,21 @@ class TestStep(BaseModel):
         elif self.action == "verify":
             if not self.target and not self.value:
                 raise ValueError("action 'verify' requires 'target' or 'value'")
+        elif self.action == "select":
+            if not self.target or not self.value:
+                raise ValueError("action 'select' requires both 'target' and 'value'")
+        elif self.action == "hover":
+            if not self.target:
+                raise ValueError("action 'hover' requires a 'target'")
+        elif self.action == "press":
+            if not self.value:
+                raise ValueError("action 'press' requires a 'value' (the key to press)")
+        elif self.action == "wait":
+            if not self.value:
+                raise ValueError("action 'wait' requires a 'value' (ms or a selector/description)")
+        elif self.action == "screenshot":
+            # No required fields; step_number drives the filename downstream.
+            pass
         return self
 
 
@@ -73,31 +98,49 @@ into a JSON array of step objects. Output ONLY the JSON array — no prose, no
 explanation, no markdown code fences.
 
 Each object has these fields:
-  - "action": one of "goto", "type", "click", "verify"
+  - "action": one of "goto", "type", "click", "verify", "select", "hover",
+              "press", "wait", "screenshot"
   - "target": a UI element description or selector (string or null)
-  - "value":  text to type or text to verify (string or null)
+  - "value":  text to type, option to select, key to press, verify text,
+              or a wait duration/selector (string or null)
   - "url":    a URL (string or null)
 
 Rules you MUST follow (do not emit null where a value is required):
-  - "goto"   requires "url".
-  - "type"   requires "target" AND "value".
-  - "click"  requires "target".
-  - "verify" requires "target" OR "value".
+  - "goto"       requires "url".
+  - "type"       requires "target" AND "value".
+  - "click"      requires "target".
+  - "verify"     requires "target" OR "value".
+  - "select"     requires "target" AND "value" (value = visible option text).
+  - "hover"      requires "target".
+  - "press"      requires "value" (the key, e.g. "Enter"); "target" optional.
+  - "wait"       requires "value" (a number of milliseconds, OR a selector/
+                 element description to wait for).
+  - "screenshot" requires no fields (target/value/url may all be null).
 
 Worked example.
 
 Input:
   Go to https://example.com/login
   Type admin into the username field
+  Select United States from the country dropdown
+  Hover over the profile icon
   Click the login button
+  Press Enter
+  Wait 2000
   Verify text Welcome appears
+  Take a screenshot
 
 Output:
 [
   {"action": "goto", "target": null, "value": null, "url": "https://example.com/login"},
   {"action": "type", "target": "username field", "value": "admin", "url": null},
+  {"action": "select", "target": "country dropdown", "value": "United States", "url": null},
+  {"action": "hover", "target": "profile icon", "value": null, "url": null},
   {"action": "click", "target": "login button", "value": null, "url": null},
-  {"action": "verify", "target": null, "value": "Welcome", "url": null}
+  {"action": "press", "target": null, "value": "Enter", "url": null},
+  {"action": "wait", "target": null, "value": "2000", "url": null},
+  {"action": "verify", "target": null, "value": "Welcome", "url": null},
+  {"action": "screenshot", "target": null, "value": null, "url": null}
 ]
 """
 
@@ -258,10 +301,49 @@ _RULE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"^\s*(?:go\s*to|goto|navigate\s*to|open)\s+(?P<url>\S+)", re.IGNORECASE),
     ),
     (
+        "select",
+        re.compile(
+            r"^\s*(?:select|choose|pick)\s+(?P<value>.+?)\s+"
+            r"(?:from|in)\s+(?:the\s+)?(?P<target>.+)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "type",
         re.compile(
             r"^\s*(?:type|enter|input)\s+(?P<value>.+?)\s+"
             r"(?:into|in)\s+(?:the\s+)?(?P<target>.+)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "hover",
+        re.compile(
+            r"^\s*(?:hover)\s+(?:over\s+)?(?:on\s+)?(?:the\s+)?(?P<target>.+)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "press",
+        re.compile(
+            r"^\s*(?:press|hit)\s+(?:the\s+)?(?P<value>.+?)"
+            r"(?:\s+key)?"
+            r"(?:\s+(?:on|in)\s+(?:the\s+)?(?P<target>.+))?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "wait",
+        re.compile(
+            r"^\s*(?:wait|pause)\s+(?:for\s+)?(?P<value>.+?)"
+            r"(?:\s+(?:ms|milliseconds|to\s+appear))?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "screenshot",
+        re.compile(
+            r"^\s*(?:take\s+(?:a\s+)?screenshot|screenshot|capture(?:\s+screen)?)\s*$",
             re.IGNORECASE,
         ),
     ),
