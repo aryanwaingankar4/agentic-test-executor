@@ -1,0 +1,5 @@
+Go to https://www.saucedemo.com/
+Type "standard_user" into the username field
+Type "secret_sauce" into the password field
+Click the login button
+Verify the page shows the text "Products"
