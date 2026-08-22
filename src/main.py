@@ -3,6 +3,10 @@ main.py — glues parser.py, executor.py, and reporter.py together for a
 full end-to-end run: plain-English steps -> LLM/rule parsing -> Playwright
 execution -> HTML + JSON report with history trend tracking and
 failure screenshots.
+
+Usage:
+    python src/main.py                          # uses tests/sample_test_steps.txt
+    python src/main.py tests/saucedemo_test_steps.txt   # uses a different test file
 """
 
 import sys
@@ -20,18 +24,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 load_dotenv()
 
-with open("tests/sample_test_steps.txt") as f:
+# NEW: allow the test file to be passed on the command line; default to the
+# original login test if no argument is given, so old behaviour still works.
+test_file = sys.argv[1] if len(sys.argv) > 1 else "tests/sample_test_steps.txt"
+
+with open(test_file) as f:
     raw_text = f.read()
 
-print("Parsing steps...")
+print(f"Parsing steps from {test_file}...")
 steps = parse_steps(raw_text)
 print(f"Parsed {len(steps)} step(s)\n")
 
 print("Running in browser...")
 with sync_playwright() as p:
-    browser = p.chromium.launch(headless=False, slow_mo=500)
+    browser = p.chromium.launch(headless=False, slow_mo=1500)
     page = browser.new_page()
     results = run_plan(page, steps, screenshot_dir="reports/screenshots")
+    page.wait_for_timeout(3000)
     browser.close()
 
 print("\n--- RESULTS ---")
@@ -41,11 +50,11 @@ for r in results:
 html_path, json_path = generate_report(
     results,
     output_dir="reports",
-    test_name="Login Flow — the-internet.herokuapp.com",
+    test_name=test_file,
     screenshot_dir="reports/screenshots",
     metadata={
         "browser": "chromium",
-        "base_url": "https://the-internet.herokuapp.com",
+        "test_file": test_file,
     },
 )
 
