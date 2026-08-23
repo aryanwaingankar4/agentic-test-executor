@@ -6,7 +6,7 @@ Playwright's synchronous API.
 """
 
 from __future__ import annotations
-
+import os
 import logging
 import time
 from pathlib import Path
@@ -16,6 +16,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from parser import TestStep
 
@@ -76,6 +77,146 @@ def _prefer_actionable(locator):
     return locator.first
 
 
+# --------------------------------------------------------------------------- #
+# Self-healing selector support (retry-aware Gemini call + fallback)
+# --------------------------------------------------------------------------- #
+_TRANSIENT_MARKERS = ("429", "500", "502", "503", "504", "timeout", "deadline")
+
+
+def _is_transient_selector_error(exc: BaseException) -> bool:
+    """Heuristic: does this exception look like a temporary server hiccup?"""
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
+@retry(
+    retry=retry_if_exception(_is_transient_selector_error),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    reraise=True,
+)
+def _call_gemini_for_selector(prompt: str) -> str:
+    """
+    Perform the actual Gemini API call for selector generation, retrying on
+    transient-looking failures (503, timeouts, etc.) with exponential
+    backoff. Non-transient errors (e.g. missing/invalid API key) propagate
+    immediately via ``reraise=True`` and are handled by the caller's
+    outer safety net. Requires GEMINI_API_KEY to be set in the environment.
+    """
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            http_options=types.HttpOptions(timeout=15000),
+        ),
+    )
+    return (response.text or "").strip()
+
+
+def _find_element_via_llm(page, description: str) -> Optional[str]:
+    """
+    Last-resort, LLM-assisted selector generation for a described element.
+
+    When every static/heuristic locator strategy in ``find_element`` has
+    already failed, this helper asks Gemini to propose a single CSS selector
+    that best matches the human-readable ``description`` within the current
+    page's HTML. It is intentionally a "never raises" helper, mirroring the
+    defensive philosophy used everywhere else in this project (parser.py's
+    broad exception handling, ``_capture_failure_screenshot`` here): a
+    self-healing selector is a best-effort enhancement, and any failure
+    (missing API key, network/timeout error, empty or garbage response,
+    invalid selector) must simply yield ``None`` so ``find_element`` falls
+    through to its remaining static strategies (and, ultimately, its
+    existing ``ElementNotFoundError``).
+
+    Transient Gemini errors (503, timeouts, etc.) are retried up to 3 times
+    with exponential backoff via ``_call_gemini_for_selector`` before this
+    function gives up and returns ``None``.
+
+    Args:
+        page: The active Playwright Page object to read HTML from.
+        description: The original human-readable target description (e.g.
+            "the login button", "username field").
+
+    Returns:
+        A cleaned CSS selector string suggested by the LLM, or ``None`` if
+        anything went wrong or no usable selector could be produced.
+    """
+    try:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            logger.warning(
+                "LLM-assisted selector skipped for %r: GEMINI_API_KEY is not set",
+                description,
+            )
+            return None
+
+        html = page.content()[:15000]
+
+        prompt = (
+            "You are a web automation expert. Given the HTML of a page and a "
+            "human-readable description of an element, respond with ONLY a "
+            "single CSS selector string that best matches the described "
+            "element. No prose, no explanation, no markdown fences.\n\n"
+            f"Description: {description}\n\n"
+            f"HTML:\n{html}"
+        )
+
+        raw = _call_gemini_for_selector(prompt)
+        if not raw:
+            logger.warning(
+                "LLM-assisted selector returned an empty response for %r", description
+            )
+            return None
+
+        # Defensively strip markdown code fences and whitespace, the same way
+        # parser.py's _extract_json_array does, in case Gemini ignores the
+        # "only a selector" instruction.
+        cleaned = raw
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned)
+        cleaned = cleaned.strip().strip("`").strip()
+
+        # Guard against multi-line prose slipping through: take the first
+        # non-empty line only.
+        for line in cleaned.splitlines():
+            candidate = line.strip()
+            if candidate:
+                cleaned = candidate
+                break
+
+        if not cleaned:
+            logger.warning(
+                "LLM-assisted selector was empty after cleaning for %r", description
+            )
+            return None
+
+        logger.debug(
+            "LLM-assisted selector for %r resolved to CSS selector: %s",
+            description, cleaned,
+        )
+        return cleaned
+    except Exception as exc:  # noqa: BLE001
+        # Broad catch-all is deliberate, matching this file's established
+        # philosophy (see _capture_failure_screenshot): missing API key,
+        # network error, timeout, malformed response, or an unusable
+        # selector must all degrade to "no match" rather than crash the run
+        # or mask the real reason a step ultimately failed. This still wraps
+        # the retrying _call_gemini_for_selector helper, so any exhausted
+        # retry or genuinely permanent/unexpected error also degrades to None.
+        logger.warning(
+            "LLM-assisted selector generation failed for %r: %s", description, exc
+        )
+        return None
+
+
 def find_element(page, description: str):
     keyword = _FILLER_WORDS.sub("", description).strip()
     if not keyword:
@@ -85,6 +226,15 @@ def find_element(page, description: str):
 
     # NEW: data-testid / data-test placed early — the standard hook for
     # testable web apps — ahead of generic id/name matching.
+    #
+    # NOTE on ordering: "llm-assisted" is deliberately placed BEFORE
+    # "submit-fallback". submit-fallback matches ANY submit-type button on
+    # the page unconditionally, regardless of whether the description has
+    # anything to do with submitting — so if it were listed before the LLM
+    # strategy, it would shadow the LLM strategy on virtually every page
+    # that has a submit button, and the self-healing feature would never
+    # actually run. Keeping submit-fallback last preserves it as a true
+    # last-resort behind the LLM-assisted strategy.
     strategies = [
         ("data-testid", lambda: page.locator(f"[data-testid*='{keyword}' i]")),
         ("data-test", lambda: page.locator(f"[data-test*='{keyword}' i]")),
@@ -97,6 +247,7 @@ def find_element(page, description: str):
         ("name-contains", lambda: page.locator(f"[name*='{keyword}' i]")),
         ("id-contains", lambda: page.locator(f"[id*='{keyword}' i]")),
         ("aria-label-contains", lambda: page.locator(f"[aria-label*='{keyword}' i]")),
+        ("llm-assisted", lambda: page.locator(_find_element_via_llm(page, description) or ":root:not(*)")),
         ("submit-fallback", lambda: page.locator("button[type=submit], input[type=submit]")),
     ]
 
