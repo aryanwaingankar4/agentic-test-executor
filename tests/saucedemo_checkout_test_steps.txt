@@ -1,0 +1,16 @@
+Go to https://www.saucedemo.com/
+Type "standard_user" into the username field
+Type "secret_sauce" into the password field
+Click the login button
+Wait for "Products" to appear
+Select "Price (low to high)" in the sort dropdown
+Click the "Add to cart" button for Sauce Labs Backpack
+Hover over the shopping cart icon
+Click the shopping cart icon
+Verify the page shows the text "Sauce Labs Backpack"
+Click the checkout button
+Type "Aryan" into the first name field
+Type "Waingankar" into the last name field
+Type "411001" into the zip code field
+Click the continue button
+Verify the page shows the text "Checkout: Overview"

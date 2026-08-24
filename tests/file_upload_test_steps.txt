@@ -1,0 +1,4 @@
+Go to https://the-internet.herokuapp.com/upload
+Click the choose file button
+Wait 1000
+Verify the page shows the text "File Upload"

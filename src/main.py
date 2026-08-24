@@ -21,7 +21,6 @@ from executor import run_plan
 from reporter import generate_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
 load_dotenv()
 
 # NEW: allow the test file to be passed on the command line; default to the

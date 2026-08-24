@@ -1,0 +1,5 @@
+Go to https://the-internet.herokuapp.com/login
+Type "tomsmith" into the credential entry widget for account identification
+Type "SuperSecretPassword!" into the secret passphrase entry widget
+Click the authenticate now control
+Verify the page shows the text "You logged into a secure area"

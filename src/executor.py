@@ -217,7 +217,7 @@ def _find_element_via_llm(page, description: str) -> Optional[str]:
         return None
 
 
-def find_element(page, description: str):
+def find_element(page, description: str, action: Optional[str] = None):
     keyword = _FILLER_WORDS.sub("", description).strip()
     if not keyword:
         keyword = description
@@ -235,6 +235,15 @@ def find_element(page, description: str):
     # that has a submit button, and the self-healing feature would never
     # actually run. Keeping submit-fallback last preserves it as a true
     # last-resort behind the LLM-assisted strategy.
+    #
+    # NOTE on submit-fallback gating: submit-fallback matches ANY submit-type
+    # button unconditionally, which is only ever meaningful for a "click"
+    # action. For explicitly known non-click actions (select, hover, type,
+    # press, wait) it would hand an arbitrary submit button to e.g.
+    # select_option, producing a confusing low-level Playwright error instead
+    # of the intended ElementNotFoundError. It is therefore included only for
+    # a "click" action, or when action is None (unknown caller) to preserve
+    # the original behavior.
     strategies = [
         ("data-testid", lambda: page.locator(f"[data-testid*='{keyword}' i]")),
         ("data-test", lambda: page.locator(f"[data-test*='{keyword}' i]")),
@@ -248,8 +257,12 @@ def find_element(page, description: str):
         ("id-contains", lambda: page.locator(f"[id*='{keyword}' i]")),
         ("aria-label-contains", lambda: page.locator(f"[aria-label*='{keyword}' i]")),
         ("llm-assisted", lambda: page.locator(_find_element_via_llm(page, description) or ":root:not(*)")),
-        ("submit-fallback", lambda: page.locator("button[type=submit], input[type=submit]")),
     ]
+
+    if action == "click" or action is None:
+        strategies.append(
+            ("submit-fallback", lambda: page.locator("button[type=submit], input[type=submit]"))
+        )
 
     for name, strategy in strategies:
         try:
@@ -270,7 +283,7 @@ def _do_goto(page: Page, step: TestStep) -> str:
     if not step.url:
         raise NavigationError("goto step is missing a 'url' value")
     try:
-        page.goto(step.url, timeout=DEFAULT_TIMEOUT_MS)
+        page.goto(step.url, timeout=15000, wait_until="domcontentloaded")
     except Exception as exc:
         raise NavigationError(f"Failed to navigate to '{step.url}': {exc}") from exc
     return f"Navigated to {step.url}"
@@ -281,7 +294,7 @@ def _do_type(page: Page, step: TestStep) -> str:
         raise ExecutorError("type step is missing a 'target'")
     if step.value is None:
         raise ExecutorError("type step is missing a 'value'")
-    locator = find_element(page, step.target)
+    locator = find_element(page, step.target, action="type")
     locator.fill(step.value, timeout=DEFAULT_TIMEOUT_MS)
     return f"Typed '{step.value}' into '{step.target}'"
 
@@ -289,7 +302,7 @@ def _do_type(page: Page, step: TestStep) -> str:
 def _do_click(page: Page, step: TestStep) -> str:
     if not step.target:
         raise ExecutorError("click step is missing a 'target'")
-    locator = find_element(page, step.target)
+    locator = find_element(page, step.target, action="click")
     locator.click(timeout=DEFAULT_TIMEOUT_MS)
     return f"Clicked '{step.target}'"
 
@@ -308,7 +321,7 @@ def _do_select(page: Page, step: TestStep) -> str:
         raise ExecutorError("select step is missing a 'target'")
     if step.value is None:
         raise ExecutorError("select step is missing a 'value'")
-    locator = find_element(page, step.target)
+    locator = find_element(page, step.target, action="select")
     locator.select_option(label=step.value, timeout=DEFAULT_TIMEOUT_MS)
     return f"Selected '{step.value}' in '{step.target}'"
 
@@ -316,7 +329,7 @@ def _do_select(page: Page, step: TestStep) -> str:
 def _do_hover(page: Page, step: TestStep) -> str:
     if not step.target:
         raise ExecutorError("hover step is missing a 'target'")
-    locator = find_element(page, step.target)
+    locator = find_element(page, step.target, action="hover")
     locator.hover(timeout=DEFAULT_TIMEOUT_MS)
     return f"Hovered over '{step.target}'"
 
@@ -325,7 +338,7 @@ def _do_press(page: Page, step: TestStep) -> str:
     if step.value is None:
         raise ExecutorError("press step is missing a 'value' (the key to press)")
     if step.target:
-        locator = find_element(page, step.target)
+        locator = find_element(page, step.target, action="press")
         locator.press(step.value, timeout=DEFAULT_TIMEOUT_MS)
         return f"Pressed '{step.value}' on '{step.target}'"
     page.keyboard.press(step.value)
@@ -348,7 +361,7 @@ def _do_wait(page: Page, step: TestStep) -> str:
         return f"Waited {stripped} ms"
 
     # Otherwise treat the value as a selector/description to wait for.
-    locator = find_element(page, stripped)
+    locator = find_element(page, stripped, action="wait")
     locator.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
     return f"Waited for '{stripped}' to appear"
 
